@@ -77,20 +77,24 @@ def set_time():
     synced_today = True
 
 
-def get_salah_times():
-    try:
-        url = f"https://www.londonprayertimes.com/api/times/?format=json&key={config.APIKEY}&24hours=true"
-        times = urequests.get(url).json()
-        return [
-            [int(x) for x in times["fajr"].split(":")],
-            [int(x) for x in times["sunrise"].split(":")],
-            [int(x) for x in times["dhuhr"].split(":")],
-            [int(x) for x in times["asr_2"].split(":")],
-            [int(x) for x in times["magrib"].split(":")],
-            [int(x) for x in times["isha"].split(":")],
-        ]
-    except:
-        return [[5, 0], [6, 0], [12, 0], [16, 0], [18, 0], [20, 0]]
+def get_salah_times(max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            connect(SSID, PWD)
+            url = f"https://www.londonprayertimes.com/api/times/?format=json&key={config.APIKEY}&24hours=true"
+            times = urequests.get(url).json()
+            return [
+                [int(x) for x in times["fajr"].split(":")],
+                [int(x) for x in times["sunrise"].split(":")],
+                [int(x) for x in times["dhuhr"].split(":")],
+                [int(x) for x in times["asr_2"].split(":")],
+                [int(x) for x in times["magrib"].split(":")],
+                [int(x) for x in times["isha"].split(":")],
+            ]
+        except:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+    return [[5, 0], [6, 0], [12, 0], [16, 0], [18, 0], [20, 0]]
 
 
 def get_next_salah(current_t, s_times):
@@ -323,13 +327,7 @@ last_synced = [0, 0, 0]
 
 
 def sync():
-    global \
-        synced_today, \
-        date, \
-        clock_time, \
-        salah_times, \
-        next_salah, \
-        last_prayer_fetch_date
+    global synced_today, date, clock_time
     connect(SSID, PWD)
     while synced_today == False:
         try:
@@ -337,9 +335,6 @@ def sync():
         except:
             pass
     date, clock_time = get_time()
-    last_prayer_fetch_date = date
-    salah_times = get_salah_times()
-    next_salah = get_next_salah(clock_time, salah_times)
 
 
 def main():
@@ -350,14 +345,17 @@ def main():
         date, \
         clock_time, \
         salah_times, \
-        next_salah, \
-        last_prayer_fetch_date
+        next_salah
 
     salah_names = ["Fajr", "Sunrise", "Zuhr", "Asr", "Maghrib", "Isha"]
 
     draw_clock([1, 1, 1], [0, 0, 0], [[0, 0] for _ in range(6)], [0, 0], salah_names)
 
     sync()
+
+    last_prayer_fetch_date = date
+    salah_times = get_salah_times()
+    next_salah = get_next_salah(clock_time, salah_times)
 
     draw_clock(date, clock_time, salah_times, next_salah, salah_names)
     while True:
