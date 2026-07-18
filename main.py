@@ -1,4 +1,4 @@
-from machine import Pin
+from machine import Pin, RTC
 import time
 import network
 import socket
@@ -22,33 +22,106 @@ NTP_DELTA = 2208988800
 host = "uk.pool.ntp.org"
 SSID = config.SSID
 PWD = config.PWD
+API_URL = getattr(
+    config,
+    "API_URL",
+    f"https://www.londonprayertimes.com/api/times/?format=json&key={config.APIKEY}&24hours=true",
+)
 
-rtc = machine.RTC()
+rtc = RTC()
 
 synced_today = False
 drawn_on_change = True
 current_state = 0
 last_synced = [0, 0]
 last_prayer_fetch_date = None
+last_prayer_fetch_attempt = None
+last_time_sync_attempt = None
+last_midnight_sync_date = None
+last_minute = None
+salah_names = ["Fajr", "Sunrise", "Zuhr", "Asr", "Maghrib", "Isha"]
 
 
-def connect(ssid, password):
+def connect(ssid, password, timeout=60):
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    wlan.connect(ssid, password)
-    while wlan.isconnected() == False:
-        print("Waiting for connection...")
+    if wlan.isconnected():
+        return wlan
+
+    try:
+        wlan.disconnect()
         time.sleep(1)
-    ip = wlan.ifconfig()[0]
-    print(f"Connected on {ip}")
+    except AttributeError:
+        pass
+
+    wlan.connect(ssid, password)
+    last_status = None
+    for elapsed in range(timeout):
+        if wlan.isconnected():
+            ip = wlan.ifconfig()[0]
+            print(f"Connected on {ip}")
+            return wlan
+
+        try:
+            last_status = wlan.status()
+        except AttributeError:
+            pass
+
+        if last_status == -3:
+            raise OSError("WiFi connection failed: wrong password")
+
+        print(f"Waiting for connection... status={last_status}")
+        if last_status is not None and last_status < 0 and elapsed % 10 == 9:
+            try:
+                wlan.disconnect()
+                time.sleep(1)
+            except AttributeError:
+                pass
+            wlan.connect(ssid, password)
+
+        time.sleep(1)
+
+    raise OSError(f"WiFi connection timed out: status={last_status}")
+
+
+def weekday(year, month, day):
+    offsets = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+    if month < 3:
+        year -= 1
+    return (year + year // 4 - year // 100 + year // 400 + offsets[month - 1] + day) % 7
+
+
+def days_in_month(year, month):
+    if month == 2:
+        if year % 400 == 0 or (year % 4 == 0 and year % 100 != 0):
+            return 29
+        return 28
+    if month in [4, 6, 9, 11]:
+        return 30
+    return 31
+
+
+def last_sunday(year, month):
+    last_day = days_in_month(year, month)
+    return last_day - weekday(year, month, last_day)
 
 
 def is_daylight_savings(current_time):
+    year = current_time[0]
     month = current_time[1]
+    day = current_time[2]
+    hour = current_time[3]
+
     if month in [11, 12, 1, 2]:
         return False
     if month in [4, 5, 6, 7, 8, 9]:
         return True
+    if month == 3:
+        start_day = last_sunday(year, 3)
+        return day > start_day or (day == start_day and hour >= 1)
+    if month == 10:
+        end_day = last_sunday(year, 10)
+        return day < end_day or (day == end_day and hour < 1)
     return False
 
 
@@ -68,21 +141,20 @@ def set_time():
     t = val - NTP_DELTA
     tm = time.gmtime(t)
     is_bst = is_daylight_savings(tm)
-    if not is_bst:
-        rtc.datetime((tm[0], tm[1], tm[2], tm[6] + 1, tm[3], tm[4], tm[5], 0))
-    else:
-        rtc.datetime(
-            (tm[0], tm[1], tm[2], tm[6] + 1, ((tm[3] + 1) % 24), tm[4], tm[5], 0)
-        )
+    if is_bst:
+        tm = time.gmtime(t + 3600)
+    rtc.datetime((tm[0], tm[1], tm[2], tm[6] + 1, tm[3], tm[4], tm[5], 0))
     synced_today = True
+    return True
 
 
 def get_salah_times(max_retries=3):
     for attempt in range(max_retries):
+        response = None
         try:
             connect(SSID, PWD)
-            url = f"https://www.londonprayertimes.com/api/times/?format=json&key={config.APIKEY}&24hours=true"
-            times = urequests.get(url).json()
+            response = urequests.get(API_URL)
+            times = response.json()
             return [
                 [int(x) for x in times["fajr"].split(":")],
                 [int(x) for x in times["sunrise"].split(":")],
@@ -91,10 +163,28 @@ def get_salah_times(max_retries=3):
                 [int(x) for x in times["magrib"].split(":")],
                 [int(x) for x in times["isha"].split(":")],
             ]
-        except:
+        except Exception as exc:
+            print(f"Prayer time fetch failed: {exc}")
             if attempt < max_retries - 1:
                 time.sleep(2)
-    return [[5, 0], [6, 0], [12, 0], [16, 0], [18, 0], [20, 0]]
+        finally:
+            if response is not None:
+                response.close()
+    return None
+
+
+def refresh_salah_times(fetch_date, fetch_time):
+    global salah_times, next_salah, last_prayer_fetch_date, last_synced
+
+    fetched_times = get_salah_times()
+    if fetched_times is None:
+        return False
+
+    salah_times = fetched_times
+    next_salah = get_next_salah(fetch_time, salah_times)
+    last_prayer_fetch_date = fetch_date[:]
+    last_synced = fetch_time[:]
+    return True
 
 
 def get_next_salah(current_t, s_times):
@@ -284,7 +374,8 @@ def button(pin):
         salah_times, \
         next_salah, \
         last_synced, \
-        last_prayer_fetch_date
+        last_prayer_fetch_date, \
+        last_prayer_fetch_attempt
     if current_state == 0:
         drawn_on_change = False
         if pin == button_b:
@@ -303,10 +394,8 @@ def button(pin):
     elif current_state == 2:
         if pin == button_b:
             date, clock_time = get_time()
-            last_prayer_fetch_date = date
-            salah_times = get_salah_times()
-            next_salah = get_next_salah(clock_time, salah_times)
-            last_synced = clock_time
+            last_prayer_fetch_attempt = None
+            refresh_salah_times(date, clock_time)
             draw_clock(date, clock_time, salah_times, next_salah, salah_names)
 
         if pin == button_c:
@@ -326,15 +415,25 @@ next_salah = [0, 0]
 last_synced = [0, 0, 0]
 
 
-def sync():
+def sync(max_retries=5):
     global synced_today, date, clock_time
-    connect(SSID, PWD)
-    while synced_today == False:
+    try:
+        connect(SSID, PWD)
+    except Exception as exc:
+        print(f"WiFi sync connection failed: {exc}")
+        return False
+
+    for _ in range(max_retries):
         try:
             set_time()
-        except:
-            pass
+            date, clock_time = get_time()
+            return True
+        except Exception as exc:
+            print(f"NTP sync failed: {exc}")
+            time.sleep(2)
+
     date, clock_time = get_time()
+    return False
 
 
 def main():
@@ -345,40 +444,54 @@ def main():
         date, \
         clock_time, \
         salah_times, \
-        next_salah
-
-    salah_names = ["Fajr", "Sunrise", "Zuhr", "Asr", "Maghrib", "Isha"]
+        next_salah, \
+        last_prayer_fetch_date, \
+        last_prayer_fetch_attempt, \
+        last_time_sync_attempt, \
+        last_midnight_sync_date, \
+        last_minute
 
     draw_clock([1, 1, 1], [0, 0, 0], [[0, 0] for _ in range(6)], [0, 0], salah_names)
 
     sync()
 
-    last_prayer_fetch_date = date
-    salah_times = get_salah_times()
+    refresh_salah_times(date, clock_time)
     next_salah = get_next_salah(clock_time, salah_times)
 
     draw_clock(date, clock_time, salah_times, next_salah, salah_names)
+    last_minute = date + clock_time[:2]
     while True:
         time.sleep(0.01)
         date, clock_time = get_time()
+        current_minute = date + clock_time[:2]
+        minute_changed = current_minute != last_minute
+        salah_refreshed = False
+
+        if minute_changed:
+            last_minute = current_minute[:]
+            fetch_attempt = current_minute
+            if date != last_prayer_fetch_date and fetch_attempt != last_prayer_fetch_attempt:
+                last_prayer_fetch_attempt = fetch_attempt
+                salah_refreshed = refresh_salah_times(date, clock_time)
+
+            next_salah = get_next_salah(clock_time, salah_times)
+
+            if synced_today == False and fetch_attempt != last_time_sync_attempt:
+                last_time_sync_attempt = fetch_attempt
+                sync()
+
         if current_state == 0:
-            if drawn_on_change == False:
+            if drawn_on_change == False or minute_changed:
                 draw_clock(date, clock_time, salah_times, next_salah, salah_names)
                 drawn_on_change = True
-            if clock_time[-1] == 0:
-                if date != last_prayer_fetch_date:
-                    last_prayer_fetch_date = date
-                    salah_times = get_salah_times()
-                next_salah = get_next_salah(clock_time, salah_times)
-                draw_clock(date, clock_time, salah_times, next_salah, salah_names)
-                if synced_today == False:
-                    set_time()
         if current_state == 1 or current_state == 2:
-            if drawn_on_change == False:
+            if drawn_on_change == False or salah_refreshed:
                 draw_clock(date, clock_time, salah_times, next_salah, salah_names)
                 drawn_on_change = True
-        if clock_time == [0, 0, 5]:
+        if clock_time[0] == 0 and clock_time[1] == 0 and date != last_midnight_sync_date:
+            last_midnight_sync_date = date[:]
             synced_today = False
+            last_time_sync_attempt = date + clock_time[:2]
             sync()
 
 
